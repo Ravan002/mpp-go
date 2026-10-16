@@ -540,17 +540,23 @@ func (i *Intent) broadcastTransaction(
 		if err := simulateSponsoredSenderExecution(ctx, rpc, tx); err != nil {
 			return nil, err
 		}
-		sponsoredClaimKey = tempo.ChargeSponsoredChallengeStoreKey(credential.Challenge.ID)
-		accepted, err := i.store.PutIfAbsent(
-			ctx,
-			sponsoredClaimKey,
-			credential.Challenge.ID,
-		)
+		// Preserve reservations from earlier versions while their credentials remain valid.
+		if _, exists, err := i.store.Get(ctx, tempo.ChargeSponsoredChallengeStoreKey(credential.Challenge.ID)); err != nil {
+			return nil, err
+		} else if exists {
+			return nil, mpp.ErrVerificationFailed("fee payer challenge already used")
+		}
+		clientTxHash, err := sponsoredTransactionHash(tx, sender)
+		if err != nil {
+			return nil, mpp.ErrMalformedCredential("failed to hash fee payer transaction")
+		}
+		sponsoredClaimKey = tempo.ChargeSponsoredTransactionStoreKey(clientTxHash)
+		accepted, err := i.store.PutIfAbsent(ctx, sponsoredClaimKey, clientTxHash)
 		if err != nil {
 			return nil, err
 		}
 		if !accepted {
-			return nil, mpp.ErrVerificationFailed("fee payer challenge already used")
+			return nil, mpp.ErrVerificationFailed("sponsored transaction already used")
 		}
 		releaseSponsoredClaim = true
 		if err := validateFeePayerDeadline(tx.ValidBefore, time.Now()); err != nil {
@@ -731,6 +737,17 @@ func (i *Intent) resolveRPC(request tempo.ChargeRequest) (tempo.RPCClient, error
 		return tempo.NewRPCClient(rpcURL), nil
 	}
 	return tempo.NewRPCClient(tempo.DefaultRPCURLForChain(0)), nil
+}
+
+// sponsoredTransactionHash binds the verified payer to the canonical signing payload.
+// Wire encodings, sponsor-selected fee tokens and alternate signatures must not
+// create additional sponsorship authorizations for the same payer transaction.
+func sponsoredTransactionHash(tx *tempotx.Tx, sender common.Address) (string, error) {
+	payload, err := tempotx.GetSignPayload(tx)
+	if err != nil {
+		return "", err
+	}
+	return crypto.Keccak256Hash(sender.Bytes(), payload.Bytes()).Hex(), nil
 }
 
 // deserializeTransactionCredential accepts both the broadcast transaction
